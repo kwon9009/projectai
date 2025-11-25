@@ -168,7 +168,7 @@ def check_and_download_files():
 # -----------------------------------------------
 
 # 얼굴 = 타원, 번호판 = 네모로 블러 처리 및 AI 분석
-def process_video_for_privacy(video_path: str) -> dict:
+def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
 
     try:
         # 파일 체크 및 다운로드
@@ -196,7 +196,7 @@ def process_video_for_privacy(video_path: str) -> dict:
         if fps == 0.0: fps = 30.0
 
         unique_id = str(uuid.uuid4())
-        blurred_filename = f"blurred_{unique_id}.mp4"
+        blurred_filename = f"blur_{original_filename}"
         blurred_filepath = os.path.join(UPLOAD_DIRECTORY, blurred_filename)
         
         fourcc = cv2.VideoWriter_fourcc(*'avc1')
@@ -210,6 +210,28 @@ def process_video_for_privacy(video_path: str) -> dict:
         total_detections = 0
 
         frame_count = 0
+
+        # 번호판 검증 함수
+        def is_valid_plate(x1, y1, x2, y2, frame_w, frame_h):
+            w = x2 - x1
+            h = y2 - y1
+            
+            # 1. 비율 검사 : 가로가 세로보다 훨씬 길어야 함 (1.5~6배)
+            aspect_ratio = w / h
+            if aspect_ratio < 1.5 or aspect_ratio > 6.0:
+                return False
+            
+            # 2. 크기 검사 : 화면 전체의 60%를 넘는 거대한 물체는 번호판 아님
+            plate_area = w * h
+            frame_area = frame_w * frame_h
+            if plate_area / frame_area > 0.6:
+                return False
+            
+            # 3. 최소 크기 : 너무 작은 점 같은 건 무시
+            if w < 30 or h < 10:
+                return False
+            
+            return True
 
         while cap.isOpened():
             success, frame = cap.read()
@@ -261,8 +283,8 @@ def process_video_for_privacy(video_path: str) -> dict:
                         except: pass
 
             # 2. 번호판 인식 (직사각형 블러)
-            # 민감도 0.05
-            plate_results = plate_model.predict(frame, conf=0.05, imgsz=1280, verbose=False)
+            # 민감도 0.25
+            plate_results = plate_model.predict(frame, conf=0.25, imgsz=1280, verbose=False)
 
 
             if plate_results:
@@ -273,16 +295,18 @@ def process_video_for_privacy(video_path: str) -> dict:
                         total_detections += 1
                         x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
 
-                        roi = frame[y1:y2, x1:x2]
-                        if roi.size == 0: continue
+                        if is_valid_plate(x1, y1, x2, y2, frame_width, frame_height):
+                            total_detections += 1
+                            roi = frame[y1:y2, x1:x2]
+                            if roi.size == 0: continue
 
-                        try:
-                            # 직사각형 블러
-                            kw = int((x2-x1)/2) | 1
-                            kh = int((y2-y1)/2) | 1
-                            blurred_plate = cv2.GaussianBlur(roi, (kw, kh), 0)
-                            frame[y1:y2, x1:x2] = blurred_plate
-                        except: pass
+                            try:
+                                # 직사각형 블러
+                                kw = int((x2-x1)/2) | 1
+                                kh = int((y2-y1)/2) | 1
+                                blurred_plate = cv2.GaussianBlur(roi, (kw, kh), 0)
+                                frame[y1:y2, x1:x2] = blurred_plate
+                            except: pass
 
             out.write(frame)
 
@@ -315,14 +339,14 @@ async def upload_video(
     session: AsyncSession = Depends(get_async_session)
 ):
     # 1. 원본 영상 저장
-    original_filename = f"{uuid.uuid4()}_{video.filename}"
+    original_filename = video.filename
     original_filepath = os.path.join(UPLOAD_DIRECTORY, original_filename)
     
     with open(original_filepath, "wb") as buffer:
         shutil.copyfileobj(video.file, buffer)
 
     # 2. AI 분석 실행
-    ai_result_dict = process_video_for_privacy(original_filepath)
+    ai_result_dict = process_video_for_privacy(original_filepath, original_filename)
 
     if "error" in ai_result_dict:
         raise HTTPException(status_code=500, detail=ai_result_dict["error"])
