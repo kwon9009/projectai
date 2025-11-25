@@ -1,46 +1,80 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+# ===================================
+# 1. 운영체제 및 에디터 설정 파일 (공통)
+# ===================================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
 
-# dependencies
+# ===================================
+# 2. Python (백엔드) 관련 제외
+# ===================================
+# 컴파일된 파일 및 캐시
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 가상환경 폴더 (이름이 뭐든 다 걸러냄)
+venv/
+env/
+.venv/
+.env  # ★ 중요: DB 비밀번호 등이 들어있는 파일 절대 제외
+
+# 배포 관련
+build/
+dist/
+*.egg-info/
+
+# ===================================
+# 3. Node.js / React (프론트엔드) 관련 제외
+# ===================================
+# 의존성 모듈 (용량 엄청 큼)
+node_modules/
 /node_modules
-/.pnp
-.pnp.js
 
-# testing
+# 빌드 결과물
+/build
+/dist
+
+# 로그 파일
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 테스트 커버리지
 /coverage
 
-# production
-/build
-
-# misc
-.DS_Store
+# 환경 변수 파일 (프론트엔드용)
 .env.local
 .env.development.local
 .env.test.local
 .env.production.local
 
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Python 필수 제외
-__pycache__/
-*.py[cod]
-
-# 가상환경
-.env
-venv/
-env/
-
-# 운영체제 파일
-.DS_Store
-
-# ★ 대용량 파일 절대 제외 (경로 확인 완료) ★
+# ===================================
+# 4. 대용량 미디어 및 데이터 파일 (필수 제외)
+# ===================================
+# 업로드된 파일들이 저장되는 곳 (서버 실행 시 자동 생성됨)
+uploads/
 AiProject/backend-ai/uploads/
+backend-ai/uploads/
+
+# 동영상 파일 (Git 용량 제한 걸림)
 *.mp4
 *.avi
 *.mov
+*.mkv
 
-# ★ 모델 파일 제외 (필요 시 LFS 사용하지만 일단 제외 추천) ★
+# ===================================
+# 5. AI 모델 및 가중치 파일 (용량 큼)
+# ===================================
+# 코드 실행 시 자동 다운로드되므로 굳이 올릴 필요 없음
 *.pt
-*.h5
 *.pth
+*.h5
+*.caffemodel
+*.weights
+
+# 코덱 관련 DLL (자동 다운로드됨)
+*.dll
+*.bz2
