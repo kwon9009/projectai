@@ -217,21 +217,32 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
 
         frame_count = 0 # 현재 처리 중인 프레임 번호
 
+        # 번호판 기억 저장소
+        plate_memory = {}
+
         # 번호판 검증 함수
         def is_valid_plate(x1, y1, x2, y2, frame_w, frame_h):
             # 너비, 높이 계산
             w = x2 - x1
             h = y2 - y1
             
-            # 1. 비율 검사 : 가로가 세로보다 적당히 길어야 함
-            aspect_ratio = w / h
-            if aspect_ratio < 1.2 or aspect_ratio > 8.0:
+            # [추가] 높이가 0이거나 이상하면 바로 무시 (ZeroDivisionError 방지)
+            if h <= 0: 
                 return False
             
-            # 2. 크기 검사 : 화면 전체의 5%를 넘는 거대한 물체는 번호판 아님
+            # 거리가 멀리 떨어진 번호판(너비 50px 미만) 탐지
+            if w < 50:
+                return True
+
+            # 1. 비율 검사 : 가로가 세로보다 적당히 길어야 함
+            aspect_ratio = w / h
+            if aspect_ratio < 1.0 or aspect_ratio > 8.0:
+                return False
+            
+            # 2. 크기 검사 : 화면 전체의 3%를 넘는 거대한 물체는 번호판 아님
             plate_area = w * h
             frame_area = frame_w * frame_h
-            if plate_area / frame_area > 0.05:
+            if plate_area / frame_area > 0.03:
                 return False
             
             return True
@@ -246,10 +257,13 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
             if frame_count % 30 == 0:
                 print(f"Processing frame {frame_count}...", end='\r')
 
-            # 1. 얼굴 인식 (타원형 블러) + CCTV 최적화 (imgsz=1280)
-            # imgsz=1280: 분석 해상도를 키워서 분석하므로 멀리 있는 얼굴도 잡게 함.
+            # 1. 얼굴 인식 (타원형 블러) + CCTV 최적화 (imgsz=1920)
+            # imgsz=1920: 분석 해상도를 키워서 분석하므로 멀리 있는 얼굴도 잡게 함.
             # conf : 민감도 -> conf=(이 값 이상인 것만 잡음)
-            face_results = face_model.predict(frame, conf=0.10, imgsz=1280, verbose=False)
+            # track : 단순히 찾기만 하는게 아닌, 물체의 이동 경로를 계산함.
+            # persist = True (기억 유지) : 이전 장면의 정보를 계속 기억함. 객체가 사라졌다가 나타날 때 필요
+            # tracker = "bytetrack.yaml" : 흐릿하거나 신뢰도가 낮을 물체도 연결해주는 알고리즘
+            face_results = face_model.track(frame, conf=0.25, imgsz=1920, augment=True, persist=True, tracker="bytetrack.yaml", verbose=False)
 
             # 탐지된 결과 루프
             if face_results:
@@ -263,6 +277,17 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                         # 좌표 추출
                         x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
                         
+                        # 얼굴이 너무 크면 오탐지로 무시하기 (번호판 인식 할 때 얼굴로 인식되는 경우 있음)
+                        face_w = x2 - x1
+                        face_h = y2 - y1
+                        if (face_w * face_h) > (frame_width * frame_height * 0.10): # 화면의 10% 이상이면 오탐지
+                            continue # 밑에 블러 코드 실행하지 않고 건너뜀
+
+                        # 얼굴 비율 검사 추가 (가로로 길거나, 세로로 얇은 건 얼굴이 아님)
+                        face_aspect_ratio = face_w / face_h
+                        if face_aspect_ratio > 2.0 or face_aspect_ratio < 0.25:
+                            continue
+
                         # 블러 영역 설정 (얼굴보다 조금 더 넓게 잡기)
                         w, h = x2 - x1, y2 - y1
                         pad_x = int(w * 0.1)
@@ -295,7 +320,9 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
             # 2. 번호판 인식 (직사각형 블러)
             # 민감도 0.05
             # augment=True : 이미지를 여러 번 변형해서 꼼꼼하게 검사
-            plate_results = plate_model.predict(frame, conf=0.05, imgsz=1280, augment=True, verbose=False)
+            plate_results = plate_model.track(frame, conf=0.05, imgsz=1920, augment=True, persist=True, tracker="bytetrack.yaml", verbose=False)
+
+            current_frame_ids = [] # 이번 프레임에서 잡은 번호판 ID들
 
             if plate_results:
                 for result in plate_results:
@@ -303,22 +330,61 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                     if result is None or not hasattr(result, 'boxes') or result.boxes is None: continue
 
                     for box in result.boxes:
-                        total_detections += 1
+                        
+                        # 트래킹 ID 가져오기
+                        track_id = int(box.id.item() if box.id is not None else -1)
+
                         x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
 
                         # 번호판 검증 통과한 번호판만 처리
                         if is_valid_plate(x1, y1, x2, y2, frame_width, frame_height):
                             total_detections += 1
+
+                            # 1. 블러 처리
                             roi = frame[y1:y2, x1:x2]
                             if roi.size == 0: continue
 
                             try:
-                                # 직사각형 블러 처리
                                 kw = int((x2-x1)/2) | 1
                                 kh = int((y2-y1)/2) | 1
                                 blurred_plate = cv2.GaussianBlur(roi, (kw, kh), 0)
                                 frame[y1:y2, x1:x2] = blurred_plate
                             except: pass
+
+                            # 2. 메모리에 저장
+                            if track_id != -1:
+                                plate_memory[track_id] = {'coords': (x1, y1, x2, y2), 'life': 15}
+                                current_frame_ids.append(track_id)
+
+            # 놓친 번호판 블러 처리
+            keys_to_remove = []
+            for tid, info in plate_memory.items():
+                if tid not in current_frame_ids: # 방금 놓쳤다면
+                    # 기억된 좌표로 블러
+                    lx1, ly1, lx2, ly2 = info['coords']
+
+                    # 화면 밖 체크
+                    lx1, ly1 = max(0, lx1), max(0, ly1)
+                    lx2, ly2 = min(frame_width, lx2), min(frame_height, ly2)
+
+                    roi = frame[ly1:ly2, lx1:lx2]
+                    if roi.size > 0:
+                        try:
+                            # 블러 정도
+                            kw = int((lx2-lx1)/2) | 1
+                            kh = int((ly2-ly1)/2) | 1
+                            blurred_plate = cv2.GaussianBlur(roi, (kw, kh), 0)
+                            frame[ly1:ly2, lx1:lx2] = blurred_plate
+                        except: pass
+                    
+                    # 수명 감소 (0이 되면 삭제)
+                    info['life'] -= 1
+                    if info['life'] <= 0:
+                        keys_to_remove.append(tid)
+
+            # 수명 다한 기억 삭제
+            for k in keys_to_remove:
+                del plate_memory[k]
 
             # 처리된 프레임 저장
             out.write(frame)
