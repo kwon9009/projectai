@@ -130,7 +130,7 @@ def check_and_download_files():
             url = "https://raw.githubusercontent.com/ablanco1950/LicensePlate_Yolov8_MaxFilters/main/best.pt"
             r = requests.get(url, stream=True)
 
-            if r.status_code != 200:
+            if r.status_code == 200:
                 with open(plate_model_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
@@ -216,12 +216,27 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
         def is_valid_plate(x1, y1, x2, y2, frame_w, frame_h):
             # x1, y1: 번호판 왼쪽 위 / x2, y2: 번호판 오른쪽 아래
 
+            w = x2 - x1 # 가로 길이 (오른쪽 끝 - 왼쪽 끝)
             h = y2 - y1 # 세로 길이 (아래 끝 - 위 끝)
 
-            # 높이가 0이거나 이상하면 바로 무시 (ZeroDivisionError 방지)
+            # 1. 노이즈 제거
+            if w < 5 or h < 5: return False
+
+            # 2. 높이가 0이거나 이상하면 바로 무시 (ZeroDivisionError 방지)
             if h <= 0: 
                 return False
-        
+
+            # 3. 비율 검사 (표지판/창문 같은 다른 물체 무시)
+            aspect_ratio = w / h
+            if aspect_ratio < 1.5 or aspect_ratio > 6.0:
+                return False
+
+            # 4. 크기 검사 (화면의 8% 이상이면 차 뒷유리일 확률 높음)
+            plate_area = w * h
+            frame_area = frame_w * frame_h
+            if plate_area / frame_area > 0.08:
+                return False
+
             return True
         
         # 번호판이 자동차 박스 안에 있는지 확인하는 함수
@@ -325,9 +340,9 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                         except: pass
 
             # 2. 번호판 인식 (직사각형 블러)
-            # 민감도 0.01 : 작은 번호판도 잡기 위함
+            # 민감도 0.05 : 작은 번호판도 잡기 위함
             # augment=True : 이미지를 여러 번 변형해서 꼼꼼하게 검사
-            plate_results = plate_model.track(frame, conf=0.01, imgsz=1920, augment=False, persist=True, tracker="botsort.yaml", verbose=False)
+            plate_results = plate_model.track(frame, conf=0.05, imgsz=1920, augment=False, persist=True, tracker="botsort.yaml", verbose=False)
 
             current_frame_ids = [] # 이번 프레임에서 잡은 번호판 ID들
 
@@ -344,13 +359,37 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                         x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
 
                         # 번호판 검증 통과한 번호판만 처리
-                        if is_valid_plate(x1, y1, x2, y2, frame_width, frame_height):
+                        if not is_valid_plate(x1, y1, x2, y2, frame_width, frame_height):
+                            continue
 
-                            # 번호판이 자동차 박스 안에 있지 않다면 -> 오탐지로 간주
-                            # car_boxes가 있을 때만 검사
-                            if len(car_boxes) > 0:
-                                if not is_inside_car((x1, y1, x2, y2), car_boxes):
-                                    continue # 밑에 블러 코드 실행하지 않고 건너뜀
+                        # 번호판이 자동차 박스 안에 있지 않다면 -> 오탐지로 간주
+                        # car_boxes가 있을 때만 검사
+                        valid_loc = False
+                        if len(car_boxes) > 0:
+                            p_cx = (x1 + x2) / 2
+                            p_cy = (y1 + y2) / 2
+
+                            for c_box in car_boxes:
+                                cx1, cy1, cx2, cy2 = cbox
+                                c_h = cy2 - cy1
+
+                                # 자동차 박스 안에 있는지 (여유 10%)
+                                pad_w = (cx2 - cx1) * 0.1
+                                pad_h = (cy2 - cy1) * 0.1
+                                if (cx1 - pad_w) < p_cx < (cx2 + pad_w) and \
+                                   (cy1 - pad_h) < p_cy < (cy2 + pad_h):
+                                        
+                                    # 차량 상단 30%에 있으면 무시 (창문/지붕 방지)
+                                    if (p_cy - cy1) < (c_h * 0.30):
+                                        continue
+                                    
+                                    valid_loc = True
+                                    break
+                            else:
+                                # 차량을 못 찾았을 땐 오탐지로 간주
+                                valid_loc = False
+                        
+                            if not valid_loc: continue
 
                             total_detections += 1
 
@@ -447,7 +486,7 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                 except: input_crop = car_crop
 
                 # 자른 이미지에서 번호판 찾기 (확대한 상태에서 찾음)
-                zoom_results = plate_model.predict(input_crop, conf=0.01, imgsz=640, verbose=False)
+                zoom_results = plate_model.predict(input_crop, conf=0.05, imgsz=640, verbose=False)
 
                 if zoom_results:
                     for z_result in zoom_results:
@@ -469,7 +508,15 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                             gx1 = max(0, gx1); gy1 = max(0, gy1)
                             gx2 = min(frame_width, gx2); gy2 = min(frame_height, gy2)
 
-                            # 바로 블러 처리
+                            # 모양 검사(번호판 검증 통과한 것만 블러 처리)
+                            if not is_valid_plate(gx1, gy1, gx2, gy2, frame_width, frame_height):
+                                continue
+                            
+                            # 위치 검사 (차량 상단 30% 무시)
+                            p_cy = (gy1 + gy2) / 2
+                            if (p_cy - cy1) < (ch * 0.30):
+                                continue
+
                             roi = frame[gy1:gy2, gx1:gx2] # 좌표대로 자른 영역만 가져오기
                             if roi.size > 0:
                                 try:
