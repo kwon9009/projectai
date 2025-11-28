@@ -180,6 +180,9 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
         # 두 개의 AI 모델을 로드 (메모리에 올림)
         face_model = YOLO(face_model_path)
         plate_model = YOLO(plate_model_path)
+        
+        # 자동차 인식용 표준 모델 로드 (차량을 찾아서 번호판의 오탐지를 줄이기 위함)
+        car_model = YOLO("yolov8m.pt") 
 
         # 영상 파일 열기
         cap = cv2.VideoCapture(video_path)  # OpenCV로 영상 파일 열기
@@ -213,34 +216,31 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
         def is_valid_plate(x1, y1, x2, y2, frame_w, frame_h):
             # x1, y1: 번호판 왼쪽 위 / x2, y2: 번호판 오른쪽 아래
 
-            w = x2 - x1 # 가로 길이 (오른쪽 끝 - 왼쪽 끝)
             h = y2 - y1 # 세로 길이 (아래 끝 - 위 끝)
-
-            # 최소 크기 검사
-            if w < 10 or h < 5:
-                return False
 
             # 높이가 0이거나 이상하면 바로 무시 (ZeroDivisionError 방지)
             if h <= 0: 
                 return False
-
-            # 작은 번호판 탐지
-            if w < 100:
-                return True
-
-            # 비율 검사
-            aspect_ratio = w / h # 가로:세로 비율
-            # 너무 정사각형이거나 세로로 길면 무시 (간판이나 다른 물체 탐지 방지)
-            if aspect_ratio < 0.2 or aspect_ratio > 10.0:
-                return False
-            
-            # 크기 검사 : 화면 전체의 10%를 넘는 거대한 물체는 번호판 아님
-            plate_area = w * h
-            frame_area = frame_w * frame_h
-            if plate_area / frame_area > 0.10:
-                return False
         
             return True
+        
+        # 번호판이 자동차 박스 안에 있는지 확인하는 함수
+        def is_inside_car(plate_box, car_boxes):
+            px1, py1, px2, py2 = plate_box
+            p_center_x = (px1 + px2) / 2
+            p_center_y = (py1 + py2) / 2
+
+            for c_box in car_boxes:
+                cx1, cy1, cx2, cy2 = c_box
+                # 번호판 중심점이 자동차 박스 안에 있는지 확인
+                # 자동차 박스를 확장해서 검사
+                pad_w = (cx2 - cx1) * 0.05
+                pad_h = (cy2 - cy1) * 0.10
+
+                if (cx1 - pad_w) < p_center_x < (cx2 + pad_w) and \
+                (cy1 - pad_h) < p_center_y < (cy2 + pad_h):
+                    return True
+            return False
 
         # 영상이 끝날 때까지 프레임 반복 처리 시작
         while cap.isOpened():
@@ -252,8 +252,16 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
             if frame_count % 30 == 0:
                 print(f"Processing frame {frame_count}...", end='\r')
 
-            # 1. 얼굴 인식 (타원형 블러) + CCTV 최적화 (imgsz=1920)
-            # imgsz=1920: 분석 해상도를 키워서 분석하므로 멀리 있는 얼굴도 잡게 함.
+            # 차량 탐지 (2=car, 3=motorcycle, 5=bus, 7=truck)
+            car_results = car_model(frame, classes=[2, 3, 5, 7], imgsz=640, verbose=False, conf=0.25)
+            
+            car_boxes = []
+            if car_results:
+                for r in car_results:
+                    for box in r.boxes:
+                        car_boxes.append(box.xyxy[0].cpu().numpy())
+                                
+            # imgsz=1280: 분석 해상도를 키워서 분석하므로 멀리 있는 얼굴도 잡게 함.
             # conf : 민감도 -> conf=(이 값 이상인 것만 잡음)
             # track : 단순히 찾기만 하는게 아닌, 물체의 이동 경로를 계산함.
             # persist = True (기억 유지) : 이전 장면의 정보를 계속 기억함. 객체가 사라졌다가 나타날 때 필요
@@ -319,7 +327,7 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
             # 2. 번호판 인식 (직사각형 블러)
             # 민감도 0.01 : 작은 번호판도 잡기 위함
             # augment=True : 이미지를 여러 번 변형해서 꼼꼼하게 검사
-            plate_results = plate_model.track(frame, conf=0.01, imgsz=1920, augment=True, persist=True, tracker="botsort.yaml", verbose=False)
+            plate_results = plate_model.track(frame, conf=0.01, imgsz=1920, augment=False, persist=True, tracker="botsort.yaml", verbose=False)
 
             current_frame_ids = [] # 이번 프레임에서 잡은 번호판 ID들
 
@@ -337,14 +345,21 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
 
                         # 번호판 검증 통과한 번호판만 처리
                         if is_valid_plate(x1, y1, x2, y2, frame_width, frame_height):
+
+                            # 번호판이 자동차 박스 안에 있지 않다면 -> 오탐지로 간주
+                            # car_boxes가 있을 때만 검사
+                            if len(car_boxes) > 0:
+                                if not is_inside_car((x1, y1, x2, y2), car_boxes):
+                                    continue # 밑에 블러 코드 실행하지 않고 건너뜀
+
                             total_detections += 1
 
                             # 번호판 영역 확장(안정적으로 블러 처리하기 위함)
                             w_plate = x2 - x1
                             h_plate = y2 - y1
                             
-                            pad_w = int(w_plate * 0.15) # 좌우 15% 확장
-                            pad_h = int(h_plate * 0.15) # 상하 15% 확장
+                            pad_w = int(w_plate * 0.10) # 좌우 10% 확장
+                            pad_h = int(h_plate * 0.10) # 상하 10% 확장
                             
                             # 확장된 좌표 계산 (화면 밖으로 나가지 않게 조절)
                             px1 = max(0, x1 - pad_w)
@@ -374,7 +389,7 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
 
                             # 2. 메모리에 저장
                             if track_id != -1:
-                                plate_memory[track_id] = {'coords': (px1, py1, px2, py2), 'life': 30}
+                                plate_memory[track_id] = {'coords': (px1, py1, px2, py2), 'life': 15}
                                 current_frame_ids.append(track_id)
 
             # 놓친 번호판 블러 처리
@@ -406,6 +421,64 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
             # 수명 다한 기억 삭제
             for k in keys_to_remove:
                 del plate_memory[k]
+
+            # 멀리 있는 차량도 탐지
+            # 차를 잘라내서(Crop) 확대해서 봄
+            for cbox in car_boxes:
+                cx1, cy1, cx2, cy2 = map(int, cbox)
+                cw, ch = cx2 - cx1, cy2 - cy1
+
+                # 차량 영역 자르기
+                pad_w = int(cw * 0.20)
+                pad_h = int(ch * 0.20)
+                bx1 = max(0, cx1 - pad_w)
+                by1 = max(0, cy1 - pad_h)
+                bx2 = min(frame_width, cx2 + pad_w)
+                by2 = min(frame_height, cy2 + pad_h)
+
+                car_crop = frame[by1:by2, bx1:bx2]
+                if car_crop.size == 0: continue
+
+                # 차가 작으면 이미지를 3배 확대해서 보여줌
+                try:
+                    input_crop = car_crop
+                    if car_crop.shape[1] < 200: 
+                        input_crop = cv2.resize(car_crop, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+                except: input_crop = car_crop
+
+                # 자른 이미지에서 번호판 찾기 (확대한 상태에서 찾음)
+                zoom_results = plate_model.predict(input_crop, conf=0.01, imgsz=640, verbose=False)
+
+                if zoom_results:
+                    for z_result in zoom_results:
+                        if z_result.boxes is None: continue
+                        for z_box in z_result.boxes:
+                            zx1, zy1, zx2, zy2 = map(int, z_box.xyxy[0].cpu().numpy())
+
+                            # 확대한 경우 비율에 맞춰 다시 줄여야 함
+                            if car_crop.shape[1] < 200:
+                                zx1, zy1, zx2, zy2 = int(zx1/3), int(zy1/3), int(zx2/3), int(zy2/3)
+
+                            # 원래 프레임 좌표로 변환
+                            gx1 = bx1 + zx1
+                            gy1 = by1 + zy1
+                            gx2 = bx1 + zx2
+                            gy2 = by1 + zy2
+                                
+                            # 좌표가 화면 밖으로 나가지 않게 조절
+                            gx1 = max(0, gx1); gy1 = max(0, gy1)
+                            gx2 = min(frame_width, gx2); gy2 = min(frame_height, gy2)
+
+                            # 바로 블러 처리
+                            roi = frame[gy1:gy2, gx1:gx2] # 좌표대로 자른 영역만 가져오기
+                            if roi.size > 0:
+                                try:
+                                    # 블러 정도
+                                    kw = int((gx2-gx1)/2) | 1
+                                    kh = int((gy2-gy1)/2) | 1
+                                    frame[gy1:gy2, gx1:gx2] = cv2.GaussianBlur(roi, (kw, kh), 0)
+                                    total_detections += 1
+                                except: pass
 
             # 처리된 프레임을 비디오 파일에 저장(녹화)
             out.write(frame)
