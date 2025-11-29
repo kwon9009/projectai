@@ -1,0 +1,6 @@
+# Python cache files
+__pycache__/
+*.pyc
+
+# IDE files (e.g., VS Code)
+.vscode/
