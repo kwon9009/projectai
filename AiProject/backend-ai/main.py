@@ -234,7 +234,7 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                 return False
 
             # 노이즈 제거
-            if w < 5 or h < 5: return False
+            if w < 10 or h < 5: return False
 
             # 보닛(Bonnet) 필터: 화면 맨 아래쪽에 꽉 찬 큰 물체는 내 차 보닛임 -> 무시
             # y2(아래쪽 좌표)가 화면 밑바닥(95% 지점)에 있고, 너비가 화면 절반 이상이면 무시
@@ -243,10 +243,13 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
 
             # 비율 검사 (표지판/창문 같은 다른 물체 무시)
             aspect_ratio = w / h
-            # 작은 번호판(너비 100px 미만)은 각도에 따라 비율 왜곡이 심할 수 있어 조금 너그럽게
-            if w < 120:
-                if aspect_ratio < 1.2 or aspect_ratio > 5.0:
+            # 작은 번호판 (멀리 있거나 정사각형에 가까운 경우)
+            if w < 100:
+                if aspect_ratio < 1.0 or aspect_ratio > 6.0:
                     return False
+                else:
+                    # 큰 번호판: 약간 비스듬한 번호판도 허용
+                    if aspect_ratio < 1.3 or aspect_ratio > 6.0: return False
         
             # 크기 검사 (화면의 3% 이상이면 차 뒷유리 등 다른 객체일 확률 높음)
             plate_area = w * h
@@ -267,7 +270,7 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                 print(f"Processing frame {frame_count}...", end='\r')
 
             # 차량 탐지 + 차종 식별 (2=car, 3=motorcycle, 5=bus, 7=truck)
-            car_results = car_model(frame, classes=[2, 3, 5, 7], imgsz=640, verbose=False, conf=0.1)
+            car_results = car_model(frame, classes=[2, 3, 5, 7], imgsz=640, verbose=False, conf=0.01)
             
             car_boxes = []
             if car_results:
@@ -392,16 +395,16 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
 
 
                                     # 차종별 상단 무시 (버스 텍스트 방지)
-                                    # 버스(5)나 트럭(7)은 번호판이 맨 아래에만 있음. 상단 75% 무시
+                                    # 버스(5)나 트럭(7)은 번호판이 맨 아래에만 있음. 상단 70% 무시
                                     if c_cls in [5, 7]:
-                                        if p_cy < (cy1 + c_h * 0.75): continue 
+                                        if p_cy < (cy1 + c_h * 0.70): continue 
                                     else:
-                                        # 승용차(2)는 상단 50% 무시
-                                        if p_cy < (cy1 + c_h * 0.50): continue
+                                        # 승용차(2)는 상단 30% 무시
+                                        if p_cy < (cy1 + c_h * 0.30): continue
 
                                     # 너비 제한
-                                    # 번호판이 차량 너비의 45%를 넘으면 가짜 (유리창 전체 오인 방지)
-                                    if (x2 - x1) > (c_w * 0.45): continue
+                                    # 번호판이 차량 너비의 55%를 넘으면 가짜 (유리창 전체 오인 방지)
+                                    if (x2 - x1) > (c_w * 0.55): continue
 
                                     # 좌우 치우침 검사 (측면 광고 방지)
                                     c_cx = (cx1 + cx2) / 2
@@ -442,15 +445,6 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                         if roi.size == 0: continue
 
                         try:
-                            # 밝기 필터: 너무 밝은 헤드라이트는 번호판이 아님
-                            # 크기가 80px 이상인 비교적 큰 탐지 객체에 대해서만 밝기 검사 수행
-                            if w_plate > 80:
-                                gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                                mean_brightness = cv2.mean(gray_roi)[0]
-                                # 평균 밝기가 245 이상이면(거의 흰색) 헤드라이트로 간주하고 무시
-                                if mean_brightness > 245: 
-                                    continue
-
                             # 블러 정도
                             kw = int((px2-px1)/2) | 1
                             kh = int((py2-py1)/2) | 1
@@ -494,8 +488,10 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
 
             # 멀리 있는 차량도 탐지
             # 차를 잘라내서(Crop) 확대해서 봄
-            for cbox in car_boxes:
-                cx1, cy1, cx2, cy2 = map(int, cbox)
+            for c_data in car_boxes:
+                cbox_coords, c_cls = c_data
+                cx1, cy1, cx2, cy2 = [int(c) for c in cbox_coords]
+
                 cw, ch = cx2 - cx1, cy2 - cy1
 
                 # 차량 영역 자르기
@@ -549,13 +545,13 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                             c_cx = (cx1 + cx2) / 2
 
                             # 차종별 필터
-                            # 버스/트럭은 상단 75% 무시
-                            limit_ratio = 0.75 if c_cls in [5, 7] else 0.50
+                            # 버스/트럭은 상단 70% 무시
+                            limit_ratio = 0.70 if c_cls in [5, 7] else 0.30
                             if (p_cy - cy1) < (ch * limit_ratio): continue 
                             
                             # 너비 필터
-                            # 확대해서 찾았더라도, 원래 차 크기 대비 40% 이상이면 가짜 (거대 블러 방지)
-                            if (gx2 - gx1) > (cw * 0.40): continue
+                            # 확대해서 찾았더라도, 원래 차 크기 대비 50% 이상이면 가짜 (거대 블러 방지)
+                            if (gx2 - gx1) > (cw * 0.50): continue
 
                             roi = frame[gy1:gy2, gx1:gx2]
                             if roi.size > 0:
