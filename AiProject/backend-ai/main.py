@@ -1,4 +1,4 @@
-import asyncio # 비동기 처리를 위함 (동시 작업 처리를 위해)
+# import asyncio # 비동기 처리를 위함 (동시 작업 처리를 위해)
 from fastapi import FastAPI, File, UploadFile, Depends, Form, HTTPException
 # API : 서비스의 요청과 응답을 처리하는 기능
 # FastAPI : 파이썬 웹 프레임 워크
@@ -9,17 +9,14 @@ from fastapi import FastAPI, File, UploadFile, Depends, Form, HTTPException
 
 from fastapi.staticfiles import StaticFiles # 정적 파일(이미지, 영상 등)을 웹에서 접근 가능하게 하는 도구
 from fastapi.middleware.cors import CORSMiddleware # 다른 도메인(React 등)에서 서버로 요청을 보낼 수 있게 허용하는 보안 설정 도구
-from sqlmodel import SQLModel, Session, select # DB 모델 정의 및 쿼리 작성을 위한 도구
+from sqlmodel import SQLModel, select # DB 모델 정의 및 쿼리 작성을 위한 도구
 from sqlalchemy.ext.asyncio import AsyncSession # 비동기 DB 처리를 위한 세션 도구
 from pydantic import BaseModel # 데이터 검증을 위한 모델 도구 (입력 데이터 형식 정의)
-import uuid # 파일명 중복 방지를 위한 고유 ID 생성 도구
 from database import async_engine, create_db_and_tables, get_async_session # database.py에서 정의한 DB 연결 도구들 가져오기
 import models # models.py에서 정의한 DB 테이블 구조 가져오기
 import security # security.py에서 정의한 비밀번호 암호화 도구 가져오기
 import shutil # 파일 저장(복사, 이동)을 위한 파일 관리 도구 라이브러리
 import os # 파일 경로, 폴더 생성 등 운영체제 기능 사용 도구
-import sys # 시스템 관련 기능을 사용하기 위한 모듈
-import cv2  # OpenCV: 영상 처리 핵심 라이브러리
 import numpy as np # 행렬 연산 도구 (이미지 데이터 처리)
 import requests # 인터넷에서 파일(AI 모델 등)을 다운로드하기 위한 도구
 import bz2 # 압축 해제를 위한 라이브러리
@@ -27,6 +24,7 @@ import traceback # 에러 발생 시 자세한 원인을 출력하기 위한 도
 
 from ultralytics import YOLO # yolov8 라이브러리
 
+import cv2  # OpenCV: 영상 처리 핵심 라이브러리
 # # 윈도우 호환성 패치 (PosixPath 에러 방지)
 # import pathlib
 # temp = pathlib.PosixPath
@@ -44,6 +42,9 @@ if not os.path.exists(UPLOAD_DIRECTORY):
 # FastAPI 앱 생성
 app = FastAPI()
 
+# AI 모델을 저장할 전역 변수
+MODELS = {}
+
 #===============================================================================================================
 
 # CORS(교차 출처 리소스 공유) 설정
@@ -59,6 +60,16 @@ app.add_middleware(
 @app.on_event("startup")
 async def on_startup():
     await create_db_and_tables()
+    # 서버 시작 시 AI 모델을 미리 로드
+    print("AI 모델을 로딩합니다...")
+    try:
+        face_model_path, plate_model_path = check_and_download_files()
+        MODELS['face'] = YOLO(face_model_path)
+        MODELS['plate'] = YOLO(plate_model_path)
+        MODELS['car'] = YOLO("yolov8m.pt")
+        print("✅ AI 모델 로딩 완료.")
+    except Exception as e:
+        print(f"❌ AI 모델 로딩 실패: {e}")
 
 #===============================================================================================================
 
@@ -92,19 +103,19 @@ def check_and_download_files():
         if os.path.getsize(plate_model_path) < 5 * 1024 * 1024: # 5MB 미만이면 삭제
             print("잘못된 번호판 인식 모델입니다. 삭제 후 다시 다운로드합니다.")
             try: os.remove(plate_model_path)
-            except: pass
+            except Exception as e: print(f"파일 삭제 실패: {e}")
 
     # DLL 청소
     if os.path.exists(dll_path):
         if os.path.getsize(dll_path) < 500000: # 500KB 미만이면 삭제
             try: os.remove(dll_path)
-            except: pass
+            except Exception as e: print(f"DLL 파일 삭제 실패: {e}")
     
     # 잘못된 버전의 DLL 파일 정리 (충돌 방지)
     for f in os.listdir(base_path):
         if f.startswith("openh264") and f.endswith(".dll") and f != target_dll:
             try: os.remove(os.path.join(base_path, f))
-            except: pass
+            except Exception as e: print(f"오래된 DLL 파일 삭제 실패: {e}")
 
 #===============================================================================================================
 
@@ -118,7 +129,7 @@ def check_and_download_files():
             with open(face_model_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
-        except: pass
+        except Exception as e: print(f"얼굴 인식 모델 다운로드 실패: {e}")
 
 #===============================================================================================================
 
@@ -172,17 +183,14 @@ def check_and_download_files():
 def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
 
     try:
-        # # AI 모델 체크 및 다운로드
-        face_model_path, plate_model_path = check_and_download_files()
-        
         print(f"'{video_path}' YOLOv8 얼굴 + 번호판 분석 시작.....")
 
-        # 두 개의 AI 모델을 로드 (메모리에 올림)
-        face_model = YOLO(face_model_path)
-        plate_model = YOLO(plate_model_path)
-        
-        # 자동차 인식용 표준 모델 로드 (차량을 찾아서 번호판의 오탐지를 줄이기 위함)
-        car_model = YOLO("yolov8m.pt") 
+        # 서버 시작 시 로드된 모델 가져오기
+        face_model = MODELS.get('face')
+        plate_model = MODELS.get('plate')
+        car_model = MODELS.get('car')
+        if not all([face_model, plate_model, car_model]):
+            return {"error": "AI 모델이 로드되지 않았습니다. 서버 로그를 확인하세요."}
 
         # 영상 파일 열기
         cap = cv2.VideoCapture(video_path)  # OpenCV로 영상 파일 열기
@@ -205,7 +213,9 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
         fourcc = cv2.VideoWriter_fourcc(*'avc1') # 비디오 압축 방식
         out = cv2.VideoWriter(blurred_filepath, fourcc, fps, (frame_width, frame_height))
 
-        total_detections = 0 # 총 탐지 횟수 카운트
+        # 얼굴과 번호판 카운트를 분리
+        faces_blurred_count = 0
+        plates_blurred_count = 0
 
         frame_count = 0 # 현재 처리 중인 프레임 번호
 
@@ -227,47 +237,25 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
             if w < 5 or h < 5: return False
 
             # 보닛(Bonnet) 필터: 화면 맨 아래쪽에 꽉 찬 큰 물체는 내 차 보닛임 -> 무시
-            # y2(아래쪽 좌표)가 화면 밑바닥(90% 지점)에 있고, 너비가 화면 절반 이상이면 무시
-            if y2 > frame_h * 0.90 and w > frame_w * 0.40:
+            # y2(아래쪽 좌표)가 화면 밑바닥(95% 지점)에 있고, 너비가 화면 절반 이상이면 무시
+            if y2 > frame_h * 0.95 and w > frame_w * 0.30:
                 return False
 
             # 비율 검사 (표지판/창문 같은 다른 물체 무시)
             aspect_ratio = w / h
-            # 80px 미만이면 비율이 좀 뭉개져도 통과
-            if w < 80:
-                if aspect_ratio < 1.0 or aspect_ratio > 8.0:
+            # 작은 번호판(너비 100px 미만)은 각도에 따라 비율 왜곡이 심할 수 있어 조금 너그럽게
+            if w < 120:
+                if aspect_ratio < 1.2 or aspect_ratio > 5.0:
                     return False
-            else:
-                # 큰 번호판 -> 깐깐하게 검사 (표지판/창문 제거)
-                if aspect_ratio < 1.5 or aspect_ratio > 5.0:
-                    return False
-
-            # 크기 검사 (화면의 8% 이상이면 차 뒷유리일 확률 높음)
+        
+            # 크기 검사 (화면의 3% 이상이면 차 뒷유리 등 다른 객체일 확률 높음)
             plate_area = w * h
             frame_area = frame_w * frame_h
-            if plate_area / frame_area > 0.08:
+            if plate_area / frame_area > 0.03:
                 return False
 
             return True
         
-        # 번호판이 자동차 박스 안에 있는지 확인하는 함수
-        def is_inside_car(plate_box, car_boxes):
-            px1, py1, px2, py2 = plate_box
-            p_center_x = (px1 + px2) / 2
-            p_center_y = (py1 + py2) / 2
-
-            for c_box in car_boxes:
-                cx1, cy1, cx2, cy2 = c_box
-                # 번호판 중심점이 자동차 박스 안에 있는지 확인
-                # 자동차 박스를 확장해서 검사
-                pad_w = (cx2 - cx1) * 0.20
-                pad_h = (cy2 - cy1) * 0.20
-
-                if (cx1 - pad_w) < p_center_x < (cx2 + pad_w) and \
-                (cy1 - pad_h) < p_center_y < (cy2 + pad_h):
-                    return True
-            return False
-
         # 영상이 끝날 때까지 프레임 반복 처리 시작
         while cap.isOpened():
             success, frame = cap.read() # 한 프레임 읽기
@@ -278,20 +266,21 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
             if frame_count % 30 == 0:
                 print(f"Processing frame {frame_count}...", end='\r')
 
-            # 차량 탐지 (2=car, 3=motorcycle, 5=bus, 7=truck)
+            # 차량 탐지 + 차종 식별 (2=car, 3=motorcycle, 5=bus, 7=truck)
             car_results = car_model(frame, classes=[2, 3, 5, 7], imgsz=640, verbose=False, conf=0.1)
             
             car_boxes = []
             if car_results:
                 for r in car_results:
                     for box in r.boxes:
-                        car_boxes.append(box.xyxy[0].cpu().numpy())
+                        coords = box.xyxy[0].cpu().numpy()
+                        cls_id = int(box.cls[0].item()) # 차종 ID 저장 (2, 5, 7)
+                        car_boxes.append((coords, cls_id))
                                 
             # imgsz=1280: 분석 해상도를 키워서 분석하므로 멀리 있는 얼굴도 잡게 함.
             # conf : 민감도 -> conf=(이 값 이상인 것만 잡음)
             # track : 단순히 찾기만 하는게 아닌, 물체의 이동 경로를 계산함.
             # persist = True (기억 유지) : 이전 장면의 정보를 계속 기억함. 객체가 사라졌다가 나타날 때 필요
-            # tracker = "bytetrack.yaml" : 흐릿하거나 신뢰도가 낮을 물체도 연결해주는 알고리즘
             face_results = face_model.track(frame, conf=0.25, imgsz=1280, augment=False, persist=True, tracker="botsort.yaml", verbose=False)
 
             # 탐지된 결과 루프
@@ -301,8 +290,6 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                     if result is None or not hasattr(result, 'boxes') or result.boxes is None: continue
 
                     for box in result.boxes:
-                        total_detections += 1
-                        
                         # 좌표 추출
                         # box.xyxy[0]: AI가 찾은 네모 좌표 [x1, y1, x2, y2]
                         # map(int, ...): 소수점 좌표를 정수(int)로 변환 (픽셀은 정수여야 하므로)
@@ -348,12 +335,25 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
 
                             # np.where: 마스크가 흰색인 부분은 'blurred'를, 검은색은 'roi(원본)'을 씀
                             frame[by1:by2, bx1:bx2] = np.where(mask > 0, blurred, roi)
-                        except: pass
+
+                            # 실제로 블러 처리에 성공했을 때만 카운트 증가
+                            faces_blurred_count += 1
+                            
+                        except Exception as e:
+                            # 타원 블러 실패 시, 최소한 사각형 블러라도 적용
+                            print(f"타원 블러 처리 중 오류 발생, 사각형 블러로 대체: {e}")
+                            try:
+                                kw = int((bx2-bx1)/1.5) | 1
+                                kh = int((by2-by1)/1.5) | 1
+                                frame[by1:by2, bx1:bx2] = cv2.GaussianBlur(roi, (kw, kh), 0)
+                                faces_blurred_count += 1 # 사각형 블러 성공 시에도 카운트
+                            except: pass
 
             # 2. 번호판 인식 (직사각형 블러)
             # 민감도 0.05 : 작은 번호판도 잡기 위함
             # augment=True : 이미지를 여러 번 변형해서 꼼꼼하게 검사
-            plate_results = plate_model.track(frame, conf=0.05, imgsz=1920, augment=False, persist=True, tracker="botsort.yaml", verbose=False)
+            # imgsz를 1280으로 낮춰 노이즈성 탐지를 줄이고 속도 향상
+            plate_results = plate_model.track(frame, conf=0.05, imgsz=1280, augment=False, persist=True, tracker="botsort.yaml", verbose=False)
 
             current_frame_ids = [] # 이번 프레임에서 잡은 번호판 ID들
 
@@ -376,35 +376,40 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                         # 번호판이 자동차 박스 안에 있지 않다면 -> 오탐지로 간주
                         # car_boxes가 있을 때만 검사
                         valid_loc = False
+
                         if len(car_boxes) > 0:
                             p_cx = (x1 + x2) / 2
                             p_cy = (y1 + y2) / 2
 
-                            for c_box in car_boxes:
+                            for c_data in car_boxes:
+                                c_box, c_cls = c_data # 좌표와 차종 ID 분리
                                 cx1, cy1, cx2, cy2 = c_box
-                                c_w = cx2 - cx1
-                                c_h = cy2 - cy1
+                                c_w = cx2 - cx1; c_h = cy2 - cy1
+                                pad_w = c_w * 0.20; pad_h = c_h * 0.20
 
-                                # 자동차 박스 안에 있는지 (여유 20%)
-                                pad_w = c_w * 0.20
-                                pad_h = c_h * 0.20
                                 if (cx1 - pad_w) < p_cx < (cx2 + pad_w) and \
                                    (cy1 - pad_h) < p_cy < (cy2 + pad_h):
-                                        
-                                    # 위치 필터: 단, 번호판이 아주 작으면(멀면) 위치 검사 생략 (멀면 위치 부정확함)
-                                    # 80px 이상인 큰 번호판만 '지붕/창문' 검사 수행
-                                    if (x2 - x1) > 80:
-                                        if (p_cy - cy1) < (c_h * 0.30): # 상단 30% 무시
-                                            continue
-                                    
-                                        # 좌우로 치우쳐 있는지 검사 (백라이트 제외하기)
-                                        # 번호판 중심과 차 중심의 거리가 차 폭의 35% 이상 벗어나면 백라이트일 확률이 높음
-                                        c_cx = (cx1 + cx2) / 2
-                                        if abs(p_cx - c_cx) > (c_w * 0.35): continue
 
+
+                                    # 차종별 상단 무시 (버스 텍스트 방지)
+                                    # 버스(5)나 트럭(7)은 번호판이 맨 아래에만 있음. 상단 75% 무시
+                                    if c_cls in [5, 7]:
+                                        if p_cy < (cy1 + c_h * 0.75): continue 
+                                    else:
+                                        # 승용차(2)는 상단 50% 무시
+                                        if p_cy < (cy1 + c_h * 0.50): continue
+
+                                    # 너비 제한
+                                    # 번호판이 차량 너비의 45%를 넘으면 가짜 (유리창 전체 오인 방지)
+                                    if (x2 - x1) > (c_w * 0.45): continue
+
+                                    # 좌우 치우침 검사 (측면 광고 방지)
+                                    c_cx = (cx1 + cx2) / 2
+                                    if abs(p_cx - c_cx) > (c_w * 0.40): continue
+                                    
+                                    # 모든 필터를 통과해야 번호판임.
                                     valid_loc = True
                                     break
-                        
                         else:
                             valid_loc = False
 
@@ -412,7 +417,12 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                         # 허공에 뜬 표지판이나 노이즈가 제거
                         if not valid_loc: continue
 
-                        total_detections += 1
+                        # 안정성 향상: 한 번이라도 탐지된 번호판은 '진짜'로 간주하고,
+                        # 다음 프레임부터는 위치 검증(valid_loc)을 통과하지 못해도 추적을 유지함
+                        if track_id != -1 and track_id in plate_memory:
+                            pass # 이미 아는 번호판이면 위치가 잠시 틀어져도 통과
+
+                        plates_blurred_count += 1
 
                         # 번호판 영역 확장(안정적으로 블러 처리하기 위함)
                         w_plate = x2 - x1
@@ -432,19 +442,20 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                         if roi.size == 0: continue
 
                         try:
-                            # 밝기 필터 (너무 밝은 헤드라이트 제외)
-                            # 멀리 있는 번호판은 뭉개져서 밝기 계산이 부정확할 수 있으므로, 
-                            # 크기가 클 때(100px 이상)만 밝기 검사 수행
-                            if w_plate > 100:
+                            # 밝기 필터: 너무 밝은 헤드라이트는 번호판이 아님
+                            # 크기가 80px 이상인 비교적 큰 탐지 객체에 대해서만 밝기 검사 수행
+                            if w_plate > 80:
                                 gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
                                 mean_brightness = cv2.mean(gray_roi)[0]
-                                if mean_brightness > 250: continue
+                                # 평균 밝기가 245 이상이면(거의 흰색) 헤드라이트로 간주하고 무시
+                                if mean_brightness > 245: 
+                                    continue
 
                             # 블러 정도
                             kw = int((px2-px1)/2) | 1
                             kh = int((py2-py1)/2) | 1
                             frame[py1:py2, px1:px2] = cv2.GaussianBlur(roi, (kw, kh), 0)
-                        except: pass
+                        except Exception as e: print(f"번호판 블러 처리 중 오류: {e}")
 
                         # 2. 메모리에 저장
                         if track_id != -1:
@@ -470,7 +481,7 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                             kh = int((ly2-ly1)/2) | 1
                             blurred_plate = cv2.GaussianBlur(roi, (kw, kh), 0)
                             frame[ly1:ly2, lx1:lx2] = blurred_plate
-                        except: pass
+                        except: pass # 메모리 블러는 실패해도 조용히 넘어감
                     
                     # 수명 감소 (0이 되면 삭제)
                     info['life'] -= 1
@@ -532,37 +543,44 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                             if not is_valid_plate(gx1, gy1, gx2, gy2, frame_width, frame_height):
                                 continue
                             
-                            # 위치 검사 (차량 상단 30% 무시)
+                            # 위치 검사 
                             p_cy = (gy1 + gy2) / 2
                             p_cx = (gx1 + gx2) / 2
                             c_cx = (cx1 + cx2) / 2
 
-                            # 번호판 너비가 80px 이상일 때만 상단 검사 (멀리 있는건 봐줌)
-                            if (gx2 - gx1) > 80:
-                                if (p_cy - cy1) < (ch * 0.30): continue # 상단 무시
-                                if abs(p_cx - c_cx) > (cw * 0.35): continue # 좌우 끝(백라이트) 무시
+                            # 차종별 필터
+                            # 버스/트럭은 상단 75% 무시
+                            limit_ratio = 0.75 if c_cls in [5, 7] else 0.50
+                            if (p_cy - cy1) < (ch * limit_ratio): continue 
+                            
+                            # 너비 필터
+                            # 확대해서 찾았더라도, 원래 차 크기 대비 40% 이상이면 가짜 (거대 블러 방지)
+                            if (gx2 - gx1) > (cw * 0.40): continue
 
-                            roi = frame[gy1:gy2, gx1:gx2] # 좌표대로 자른 영역만 가져오기
+                            roi = frame[gy1:gy2, gx1:gx2]
                             if roi.size > 0:
                                 try:
-                                    # 블러 정도
-                                    kw = int((gx2-gx1)/2) | 1
-                                    kh = int((gy2-gy1)/2) | 1
+                                    kw = int((gx2-gx1)/2) | 1; kh = int((gy2-gy1)/2) | 1
                                     frame[gy1:gy2, gx1:gx2] = cv2.GaussianBlur(roi, (kw, kh), 0)
-                                    total_detections += 1
-                                except: pass
+                                    plates_blurred_count += 1
+                                except Exception as e: print(f"확대 블러 처리 중 오류: {e}")
 
             # 처리된 프레임을 비디오 파일에 저장(녹화)
             out.write(frame)
 
+        total_blurred_objects = faces_blurred_count + plates_blurred_count
         cap.release() # 영상 파일 닫기
         out.release() # 저장 완료
 
-        print(f"'{blurred_filepath}' YOLO 분석 완료. (총 탐지: {total_detections})")
+        print(f"'{blurred_filepath}' YOLO 분석 완료. (총 블러 처리 객체: {total_blurred_objects})")
         
         # 결과 반환
         return {
-            "detection_summary": {"faces_blurred": total_detections},
+            "detection_summary": {
+                "faces_blurred": faces_blurred_count,
+                "plates_blurred": plates_blurred_count,
+                "total_blurred_count": total_blurred_objects
+            },
             "analyzed_video_url": f"/static/{blurred_filename}"
         }
 
