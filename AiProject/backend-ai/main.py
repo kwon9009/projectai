@@ -219,45 +219,124 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
 
         frame_count = 0 # 현재 처리 중인 프레임 번호
 
-        # 번호판 기억 저장소
+        # 번호판 기억 저장소 (개선된 구조)
+        # 구조: {track_id: {'coords': (x1,y1,x2,y2), 'velocity': (vx,vy), 'life': int, 'confidence_history': [], 'last_seen': frame_num}}
         plate_memory = {}
+        
+        # 칼만 필터 기반 위치 예측을 위한 속도 저장
+        # 이전 프레임의 차량 위치 저장 (움직임 예측용)
+        prev_car_positions = {}
 
-        # 번호판 검증 함수
+        # 번호판 검증 함수 (강화된 버전)
         def is_valid_plate(x1, y1, x2, y2, frame_w, frame_h):
-            # x1, y1: 번호판 왼쪽 위 / x2, y2: 번호판 오른쪽 아래
+            w = x2 - x1
+            h = y2 - y1
 
-            w = x2 - x1 # 가로 길이 (오른쪽 끝 - 왼쪽 끝)
-            h = y2 - y1 # 세로 길이 (아래 끝 - 위 끝)
-
-            # 높이가 0이거나 이상하면 바로 무시 (ZeroDivisionError 방지)
-            if h <= 0: 
+            # 높이가 0이거나 이상하면 바로 무시
+            if h <= 0 or w <= 0: 
                 return False
 
-            # 노이즈 제거
-            if w < 10 or h < 5: return False
+            # 노이즈 제거 (너무 작은 건 무시)
+            if w < 15 or h < 8: return False
 
-            # 보닛(Bonnet) 필터: 화면 맨 아래쪽에 꽉 찬 큰 물체는 내 차 보닛임 -> 무시
-            # y2(아래쪽 좌표)가 화면 밑바닥(95% 지점)에 있고, 너비가 화면 절반 이상이면 무시
+            # 보닛 필터
             if y2 > frame_h * 0.95 and w > frame_w * 0.30:
                 return False
 
-            # 비율 검사 (표지판/창문 같은 다른 물체 무시)
+            # 비율 검사 (한국 번호판: 가로가 세로의 약 2~2.5배)
             aspect_ratio = w / h
-            # 작은 번호판 (멀리 있거나 정사각형에 가까운 경우)
-            if w < 100:
-                if aspect_ratio < 1.0 or aspect_ratio > 6.0:
-                    return False
-                else:
-                    # 큰 번호판: 약간 비스듬한 번호판도 허용
-                    if aspect_ratio < 1.3 or aspect_ratio > 6.0: return False
+            
+            # 번호판 비율: 1.5 ~ 5.0 (너무 길거나 정사각형에 가까우면 제외)
+            if aspect_ratio < 1.5 or aspect_ratio > 5.0:
+                return False
         
-            # 크기 검사 (화면의 3% 이상이면 차 뒷유리 등 다른 객체일 확률 높음)
+            # 크기 검사 (화면의 2% 이상이면 오탐지 가능성 높음)
             plate_area = w * h
             frame_area = frame_w * frame_h
-            if plate_area / frame_area > 0.03:
+            if plate_area / frame_area > 0.02:
+                return False
+            
+            # 너무 세로로 긴 건 측면 광고일 가능성
+            if h > w * 0.8:  # 세로가 가로의 80% 이상이면 제외
                 return False
 
             return True
+        
+        # 번호판 좌표 스무딩 함수 (떨림 방지)
+        def smooth_coordinates(new_coords, old_coords, alpha=0.3):
+            """새 좌표와 이전 좌표를 보간하여 부드럽게 만듦"""
+            if old_coords is None:
+                return new_coords
+            nx1, ny1, nx2, ny2 = new_coords
+            ox1, oy1, ox2, oy2 = old_coords
+            return (
+                int(alpha * nx1 + (1 - alpha) * ox1),
+                int(alpha * ny1 + (1 - alpha) * oy1),
+                int(alpha * nx2 + (1 - alpha) * ox2),
+                int(alpha * ny2 + (1 - alpha) * oy2)
+            )
+        
+        # 움직임 예측 함수 (속도 기반)
+        def predict_position(coords, velocity, frames_ahead=1):
+            """속도를 기반으로 미래 위치 예측"""
+            if velocity is None:
+                return coords
+            x1, y1, x2, y2 = coords
+            vx, vy = velocity
+            
+            # 속도 상한선 (비정상적으로 큰 속도 방지)
+            max_speed = 50  # 픽셀/프레임
+            vx = max(-max_speed, min(max_speed, vx))
+            vy = max(-max_speed, min(max_speed, vy))
+            
+            return (
+                int(x1 + vx * frames_ahead),
+                int(y1 + vy * frames_ahead),
+                int(x2 + vx * frames_ahead),
+                int(y2 + vy * frames_ahead)
+            )
+        
+        # 확장된 블러 영역 계산 함수 (움직임 고려)
+        def get_expanded_blur_region(coords, velocity, frame_w, frame_h, expansion_ratio=0.25):
+            """속도를 고려하여 블러 영역을 확장 (움직이는 물체의 잔상 커버)"""
+            x1, y1, x2, y2 = coords
+            w, h = x2 - x1, y2 - y1
+            
+            # 원본 크기가 비정상적이면 무시 (화면의 5% 이상이면 오류)
+            if w * h > frame_w * frame_h * 0.05:
+                return (x1, y1, x2, y2)  # 확장 없이 반환
+            
+            # 기본 확장 (최대 30픽셀로 제한)
+            pad_w = min(int(w * expansion_ratio), 30)
+            pad_h = min(int(h * expansion_ratio), 30)
+            
+            # 속도가 있으면 움직이는 방향으로 추가 확장 (최대 20픽셀)
+            if velocity:
+                vx, vy = velocity
+                speed = (vx**2 + vy**2) ** 0.5
+                if speed > 5:
+                    extra_pad = min(int(speed * 0.3), 20)  # 최대 20픽셀
+                    pad_w += extra_pad
+                    pad_h += extra_pad
+            
+            # 확장된 좌표 (화면 범위 내로 제한)
+            ex1 = max(0, x1 - pad_w)
+            ey1 = max(0, y1 - pad_h)
+            ex2 = min(frame_w, x2 + pad_w)
+            ey2 = min(frame_h, y2 + pad_h)
+            
+            # 최종 크기가 원본의 3배를 넘으면 원본 크기로 제한
+            final_w, final_h = ex2 - ex1, ey2 - ey1
+            if final_w > w * 3 or final_h > h * 3:
+                return (x1, y1, x2, y2)  # 확장 없이 반환
+            
+            return (ex1, ey1, ex2, ey2)
+        
+        # 프레임 스킵 설정 (얼굴만 스킵, 번호판은 매 프레임 탐지)
+        FACE_SKIP_FRAMES = 2  # 얼굴: 3프레임당 1번 탐지
+        
+        # 얼굴 메모리 (프레임 스킵 시 블러 유지용)
+        face_memory = {}
         
         # 영상이 끝날 때까지 프레임 반복 처리 시작
         while cap.isOpened():
@@ -269,96 +348,102 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
             if frame_count % 30 == 0:
                 print(f"Processing frame {frame_count}...", end='\r')
 
-            # 차량 탐지 + 차종 식별 (2=car, 3=motorcycle, 5=bus, 7=truck)
-            car_results = car_model(frame, classes=[2, 3, 5, 7], imgsz=640, verbose=False, conf=0.01)
+            # 얼굴 탐지 여부 (프레임 스킵 - 얼굴만)
+            do_face_detection = (frame_count % (FACE_SKIP_FRAMES + 1) == 1)
+            
+            # === 차량 탐지 (매 프레임) - 해상도 높여서 버스도 잡기 ===
+            car_results = car_model(frame, classes=[2, 3, 5, 7], imgsz=960, verbose=False, conf=0.03)
             
             car_boxes = []
             if car_results:
                 for r in car_results:
                     for box in r.boxes:
                         coords = box.xyxy[0].cpu().numpy()
-                        cls_id = int(box.cls[0].item()) # 차종 ID 저장 (2, 5, 7)
+                        cls_id = int(box.cls[0].item())
                         car_boxes.append((coords, cls_id))
-                                
-            # imgsz=1280: 분석 해상도를 키워서 분석하므로 멀리 있는 얼굴도 잡게 함.
-            # conf : 민감도 -> conf=(이 값 이상인 것만 잡음)
-            # track : 단순히 찾기만 하는게 아닌, 물체의 이동 경로를 계산함.
-            # persist = True (기억 유지) : 이전 장면의 정보를 계속 기억함. 객체가 사라졌다가 나타날 때 필요
-            face_results = face_model.track(frame, conf=0.25, imgsz=1280, augment=False, persist=True, tracker="botsort.yaml", verbose=False)
+            
+            # === 얼굴 탐지 (스킵 적용) ===
+            if do_face_detection:
+                face_results = face_model.track(frame, conf=0.20, imgsz=1280, augment=False, persist=True, tracker="botsort.yaml", verbose=False)
 
-            # 탐지된 결과 루프
-            if face_results:
-                for result in face_results:
-                    # 결과 유효성 검사
-                    if result is None or not hasattr(result, 'boxes') or result.boxes is None: continue
+                if face_results:
+                    for result in face_results:
+                        if result is None or not hasattr(result, 'boxes') or result.boxes is None: continue
 
-                    for box in result.boxes:
-                        # 좌표 추출
-                        # box.xyxy[0]: AI가 찾은 네모 좌표 [x1, y1, x2, y2]
-                        # map(int, ...): 소수점 좌표를 정수(int)로 변환 (픽셀은 정수여야 하므로)
-                        x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-                        
-                        # 얼굴이 너무 크면 오탐지로 무시하기 (번호판 인식 할 때 얼굴로 인식되는 경우 있음)
-                        face_w = x2 - x1
-                        face_h = y2 - y1
-                        if (face_w * face_h) > (frame_width * frame_height * 0.025): # 화면의 2.5% 이상이면 오탐지
-                            continue # 밑에 블러 코드 실행하지 않고 건너뜀
-
-                        # 얼굴 비율 검사 추가 (가로로 길거나, 세로로 얇은 건 얼굴이 아님)
-                        face_aspect_ratio = face_w / face_h
-                        if face_aspect_ratio > 1.2 or face_aspect_ratio < 0.25:
-                            continue
-
-                        # 블러 영역 설정 (얼굴보다 조금 더 넓게 잡기)
-                        w, h = x2 - x1, y2 - y1 # 얼굴 폭, 높이 구하기
-                        pad_x = int(w * 0.1) # 폭의 10%만큼 여유 두기
-                        pad_y_top = int(h * 0.2) # 높이의 20%만큼 위로 여유 두기 (이마/머리카락)
-                        pad_y_bot = int(h * 0.2) # 높이의 20%만큼 아래로 여유 두기 (턱)
-                        
-                        # 좌표 확장 (화면 밖으로 나가지 않게 max/min 사용)
-                        bx1 = max(0, x1 - pad_x) # 왼쪽으로 확장 (0보다 작아지면 0으로)
-                        by1 = max(0, y1 - pad_y_top) # 위로 확장
-                        bx2 = min(frame_width, x2 + pad_x) # 오른쪽으로 확장 (화면 폭 넘지 않게)
-                        by2 = min(frame_height, y2 + pad_y_bot) # 아래로 확장
-                        
-                        roi = frame[by1:by2, bx1:bx2] # 얼굴 영역 자르기
-                        if roi.size == 0: continue
-                        
-                        try:
-                            # 블러 강도 설정
-                            # (bx2-bx1)/1.5 : 얼굴 크기에 비례해서 흐림 강도 조절
-                            kw = int((bx2-bx1)/1.5) | 1 # 홀수여야 해서 '| 1' 비트연산 사용
-                            kh = int((by2-by1)/1.5) | 1
-                            blurred = cv2.GaussianBlur(roi, (kw, kh), 0)
+                        for box in result.boxes:
+                            face_track_id = int(box.id.item() if box.id is not None else -1)
+                            x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
                             
-                            # 타원형 블러 만들기
-                            mask = np.zeros_like(roi)
-                            # 흰색 타원 그리기
-                            cv2.ellipse(mask, ((bx2-bx1)//2, (by2-by1)//2), ((bx2-bx1)//2, (by2-by1)//2), 0, 0, 360, (255, 255, 255), -1)
+                            face_w = x2 - x1
+                            face_h = y2 - y1
+                            if (face_w * face_h) > (frame_width * frame_height * 0.025):
+                                continue
 
-                            # np.where: 마스크가 흰색인 부분은 'blurred'를, 검은색은 'roi(원본)'을 씀
-                            frame[by1:by2, bx1:bx2] = np.where(mask > 0, blurred, roi)
+                            face_aspect_ratio = face_w / face_h if face_h > 0 else 0
+                            if face_aspect_ratio > 1.2 or face_aspect_ratio < 0.25:
+                                continue
 
-                            # 실제로 블러 처리에 성공했을 때만 카운트 증가
-                            faces_blurred_count += 1
+                            w, h = x2 - x1, y2 - y1
+                            pad_x = int(w * 0.1)
+                            pad_y_top = int(h * 0.2)
+                            pad_y_bot = int(h * 0.2)
                             
-                        except Exception as e:
-                            # 타원 블러 실패 시, 최소한 사각형 블러라도 적용
-                            print(f"타원 블러 처리 중 오류 발생, 사각형 블러로 대체: {e}")
+                            bx1 = max(0, x1 - pad_x)
+                            by1 = max(0, y1 - pad_y_top)
+                            bx2 = min(frame_width, x2 + pad_x)
+                            by2 = min(frame_height, y2 + pad_y_bot)
+                            
+                            if face_track_id != -1:
+                                face_memory[face_track_id] = {
+                                    'coords': (bx1, by1, bx2, by2),
+                                    'life': 10
+                                }
+                            
+                            roi = frame[by1:by2, bx1:bx2]
+                            if roi.size == 0: continue
+                            
                             try:
                                 kw = int((bx2-bx1)/1.5) | 1
                                 kh = int((by2-by1)/1.5) | 1
-                                frame[by1:by2, bx1:bx2] = cv2.GaussianBlur(roi, (kw, kh), 0)
-                                faces_blurred_count += 1 # 사각형 블러 성공 시에도 카운트
-                            except: pass
+                                blurred = cv2.GaussianBlur(roi, (kw, kh), 0)
+                                
+                                mask = np.zeros_like(roi)
+                                cv2.ellipse(mask, ((bx2-bx1)//2, (by2-by1)//2), ((bx2-bx1)//2, (by2-by1)//2), 0, 0, 360, (255, 255, 255), -1)
+                                frame[by1:by2, bx1:bx2] = np.where(mask > 0, blurred, roi)
+                                faces_blurred_count += 1
+                            except:
+                                try:
+                                    kw = int((bx2-bx1)/1.5) | 1
+                                    kh = int((by2-by1)/1.5) | 1
+                                    frame[by1:by2, bx1:bx2] = cv2.GaussianBlur(roi, (kw, kh), 0)
+                                    faces_blurred_count += 1
+                                except: pass
+            else:
+                # 얼굴 스킵 프레임: 메모리 기반 블러
+                face_keys_to_remove = []
+                for fid, finfo in face_memory.items():
+                    fx1, fy1, fx2, fy2 = finfo['coords']
+                    roi = frame[fy1:fy2, fx1:fx2]
+                    if roi.size > 0:
+                        try:
+                            kw = int((fx2-fx1)/1.5) | 1
+                            kh = int((fy2-fy1)/1.5) | 1
+                            blurred = cv2.GaussianBlur(roi, (kw, kh), 0)
+                            mask = np.zeros_like(roi)
+                            cv2.ellipse(mask, ((fx2-fx1)//2, (fy2-fy1)//2), ((fx2-fx1)//2, (fy2-fy1)//2), 0, 0, 360, (255, 255, 255), -1)
+                            frame[fy1:fy2, fx1:fx2] = np.where(mask > 0, blurred, roi)
+                        except: pass
+                    finfo['life'] -= 1
+                    if finfo['life'] <= 0:
+                        face_keys_to_remove.append(fid)
+                for fk in face_keys_to_remove:
+                    del face_memory[fk]
 
-            # 2. 번호판 인식 (직사각형 블러)
-            # 민감도 0.05 : 작은 번호판도 잡기 위함
-            # augment=True : 이미지를 여러 번 변형해서 꼼꼼하게 검사
-            # imgsz를 1280으로 낮춰 노이즈성 탐지를 줄이고 속도 향상
-            plate_results = plate_model.track(frame, conf=0.05, imgsz=1280, augment=False, persist=True, tracker="botsort.yaml", verbose=False)
+            # === 번호판 탐지 (매 프레임 - 스킵 없음) ===
+            plate_results = plate_model.track(frame, conf=0.08, imgsz=1920, augment=False, persist=True, tracker="botsort.yaml", verbose=False)
 
             current_frame_ids = [] # 이번 프레임에서 잡은 번호판 ID들
+            detected_plates_this_frame = {}  # {track_id: coords} 이번 프레임 탐지 결과
 
             if plate_results:
                 for result in plate_results:
@@ -376,106 +461,180 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                         if not is_valid_plate(x1, y1, x2, y2, frame_width, frame_height):
                             continue
 
-                        # 번호판이 자동차 박스 안에 있지 않다면 -> 오탐지로 간주
-                        # car_boxes가 있을 때만 검사
+                        # 번호판이 자동차 박스 안에 있는지 검사
                         valid_loc = False
+                        p_cx = (x1 + x2) / 2
+                        p_cy = (y1 + y2) / 2
+                        plate_w = x2 - x1
 
                         if len(car_boxes) > 0:
-                            p_cx = (x1 + x2) / 2
-                            p_cy = (y1 + y2) / 2
-
                             for c_data in car_boxes:
-                                c_box, c_cls = c_data # 좌표와 차종 ID 분리
+                                c_box, c_cls = c_data
                                 cx1, cy1, cx2, cy2 = c_box
                                 c_w = cx2 - cx1; c_h = cy2 - cy1
+                                c_cx = (cx1 + cx2) / 2
+                                
+                                # 번호판 중심이 차량 영역 안에 있는지 (패딩 20%)
                                 pad_w = c_w * 0.20; pad_h = c_h * 0.20
+                                if not ((cx1 - pad_w) < p_cx < (cx2 + pad_w) and 
+                                        (cy1 - pad_h) < p_cy < (cy2 + pad_h)):
+                                    continue
+                                
+                                # === 측면 광고 필터 (핵심!) ===
+                                # 번호판이 차량 중앙에서 너무 벗어나면 측면 광고
+                                if abs(p_cx - c_cx) > (c_w * 0.35):
+                                    continue
+                                
+                                # 번호판이 너무 크면 오탐지 (차량 너비의 45% 이하만 허용)
+                                if plate_w > (c_w * 0.45):
+                                    continue
+                                
+                                # === 상단 필터 (완화) ===
+                                # 버스/트럭: 상단 25%만 무시 (앞번호판 허용)
+                                if c_cls in [5, 7]:
+                                    if p_cy < (cy1 + c_h * 0.25): continue
+                                else:
+                                    # 승용차: 상단 15%만 무시
+                                    if p_cy < (cy1 + c_h * 0.15): continue
+                                
+                                valid_loc = True
+                                break
+                        
+                        # 차량 없어도 메모리에 있으면 계속 추적
+                        if not valid_loc and track_id != -1 and track_id in plate_memory:
+                            valid_loc = True
+                        
+                        # 차량 미탐지 + 메모리에도 없지만, 번호판이 명확한 경우 (추가 검증)
+                        if not valid_loc and len(car_boxes) == 0:
+                            # 번호판 특성이 매우 명확한 경우에만 허용
+                            plate_h = y2 - y1
+                            plate_aspect = plate_w / plate_h if plate_h > 0 else 0
+                            # 한국 번호판 전형적 비율: 2.0~3.5 (매우 엄격)
+                            # 크기도 적당해야 함 (너무 크거나 작으면 제외)
+                            plate_area = plate_w * plate_h
+                            frame_area = frame_width * frame_height
+                            area_ratio = plate_area / frame_area
+                            
+                            if (2.0 <= plate_aspect <= 3.5 and 
+                                0.0005 < area_ratio < 0.008 and
+                                p_cy > frame_height * 0.3):  # 화면 상단 30%는 제외
+                                valid_loc = True
+                        
+                        if not valid_loc:
+                            continue
 
-                                if (cx1 - pad_w) < p_cx < (cx2 + pad_w) and \
-                                   (cy1 - pad_h) < p_cy < (cy2 + pad_h):
-
-
-                                    # 차종별 상단 무시 (버스 텍스트 방지)
-                                    # 버스(5)나 트럭(7)은 번호판이 맨 아래에만 있음. 상단 70% 무시
-                                    if c_cls in [5, 7]:
-                                        if p_cy < (cy1 + c_h * 0.70): continue 
-                                    else:
-                                        # 승용차(2)는 상단 30% 무시
-                                        if p_cy < (cy1 + c_h * 0.30): continue
-
-                                    # 너비 제한
-                                    # 번호판이 차량 너비의 55%를 넘으면 가짜 (유리창 전체 오인 방지)
-                                    if (x2 - x1) > (c_w * 0.55): continue
-
-                                    # 좌우 치우침 검사 (측면 광고 방지)
-                                    c_cx = (cx1 + cx2) / 2
-                                    if abs(p_cx - c_cx) > (c_w * 0.40): continue
-                                    
-                                    # 모든 필터를 통과해야 번호판임.
-                                    valid_loc = True
-                                    break
-                        else:
-                            valid_loc = False
-
-                        # 차가 발견되지 않았거나(len=0), 차 밖이면 -> 가짜로 간주하고 무시
-                        # 허공에 뜬 표지판이나 노이즈가 제거
-                        if not valid_loc: continue
-
-                        # 안정성 향상: 한 번이라도 탐지된 번호판은 '진짜'로 간주하고,
-                        # 다음 프레임부터는 위치 검증(valid_loc)을 통과하지 못해도 추적을 유지함
+                        # 현재 좌표
+                        current_coords = (x1, y1, x2, y2)
+                        
+                        # 트래킹 ID가 있고 메모리에 있으면 스무딩 및 속도 계산
+                        velocity = (0, 0)
                         if track_id != -1 and track_id in plate_memory:
-                            pass # 이미 아는 번호판이면 위치가 잠시 틀어져도 통과
+                            old_info = plate_memory[track_id]
+                            old_coords = old_info.get('coords', current_coords)
+                            
+                            # 속도 계산 (이전 위치와 현재 위치 차이)
+                            velocity = (
+                                (x1 + x2) / 2 - (old_coords[0] + old_coords[2]) / 2,
+                                (y1 + y2) / 2 - (old_coords[1] + old_coords[3]) / 2
+                            )
+                            
+                            # 좌표 스무딩 (떨림 방지) - alpha가 낮을수록 부드럽게
+                            smoothed_coords = smooth_coordinates(current_coords, old_coords, alpha=0.4)
+                            x1, y1, x2, y2 = smoothed_coords
 
                         plates_blurred_count += 1
 
-                        # 번호판 영역 확장(안정적으로 블러 처리하기 위함)
-                        w_plate = x2 - x1
-                        h_plate = y2 - y1
-                        
-                        pad_w = int(w_plate * 0.10) # 좌우 10% 확장
-                        pad_h = int(h_plate * 0.10) # 상하 10% 확장
-                            
-                        # 확장된 좌표 계산 (화면 밖으로 나가지 않게 조절)
-                        px1 = max(0, x1 - pad_w)
-                        py1 = max(0, y1 - pad_h)
-                        px2 = min(frame_width, x2 + pad_w)
-                        py2 = min(frame_height, y2 + pad_h)
+                        # 번호판 영역 확장 (움직임 고려하여 더 넓게)
+                        blur_region = get_expanded_blur_region(
+                            (x1, y1, x2, y2), 
+                            velocity,
+                            frame_width, frame_height,
+                            expansion_ratio=0.20  # 20% 확장
+                        )
+                        px1, py1, px2, py2 = blur_region
 
                         # 1. 블러 처리
                         roi = frame[py1:py2, px1:px2]
                         if roi.size == 0: continue
 
                         try:
-                            # 블러 정도
-                            kw = int((px2-px1)/2) | 1
-                            kh = int((py2-py1)/2) | 1
+                            # 블러 정도 (더 강하게)
+                            kw = int((px2-px1)/1.5) | 1
+                            kh = int((py2-py1)/1.5) | 1
                             frame[py1:py2, px1:px2] = cv2.GaussianBlur(roi, (kw, kh), 0)
                         except Exception as e: print(f"번호판 블러 처리 중 오류: {e}")
 
-                        # 2. 메모리에 저장
+                        # 2. 메모리에 저장 (속도 정보 포함)
                         if track_id != -1:
-                            plate_memory[track_id] = {'coords': (px1, py1, px2, py2), 'life': 60}
+                            plate_memory[track_id] = {
+                                'coords': (px1, py1, px2, py2),
+                                'velocity': velocity,
+                                'life': 90,  # 3초(30fps 기준) 동안 기억 유지
+                                'last_seen': frame_count,
+                                'confidence_streak': plate_memory.get(track_id, {}).get('confidence_streak', 0) + 1
+                            }
                             current_frame_ids.append(track_id)
+                            detected_plates_this_frame[track_id] = (px1, py1, px2, py2)
 
-            # 놓친 번호판 블러 처리
+            # 놓친 번호판 블러 처리 (움직임 예측 기반)
             keys_to_remove = []
             for tid, info in plate_memory.items():
                 if tid not in current_frame_ids: # 방금 놓쳤다면
-                    # 기억된 좌표로 블러
-                    lx1, ly1, lx2, ly2 = info['coords']
+                    # 속도 기반으로 위치 예측
+                    old_coords = info['coords']
+                    velocity = info.get('velocity', (0, 0))
+                    frames_since_seen = frame_count - info.get('last_seen', frame_count)
+                    
+                    # 너무 오래 전에 본 경우 삭제 (예측이 부정확해짐)
+                    if frames_since_seen > 15:
+                        keys_to_remove.append(tid)
+                        continue
+                    
+                    # 예측 위치 계산 (속도 * 놓친 프레임 수, 최대 3프레임까지만)
+                    predicted_coords = predict_position(old_coords, velocity, min(frames_since_seen, 3))
+                    lx1, ly1, lx2, ly2 = predicted_coords
 
                     # 화면 밖 체크
                     lx1, ly1 = max(0, lx1), max(0, ly1)
                     lx2, ly2 = min(frame_width, lx2), min(frame_height, ly2)
+                    
+                    # 예측 위치가 화면 밖으로 나가면 삭제
+                    if lx2 <= lx1 or ly2 <= ly1:
+                        keys_to_remove.append(tid)
+                        continue
+                    
+                    # 블러 영역 크기 검증 (화면의 3% 초과하면 무시)
+                    blur_area = (lx2 - lx1) * (ly2 - ly1)
+                    if blur_area > frame_width * frame_height * 0.03:
+                        keys_to_remove.append(tid)
+                        continue
+
+                    # 블러 영역 확장 (움직임 기반, 제한적으로)
+                    expanded_region = get_expanded_blur_region(
+                        (lx1, ly1, lx2, ly2), velocity, frame_width, frame_height, 0.15
+                    )
+                    lx1, ly1, lx2, ly2 = expanded_region
+                    
+                    # 확장 후에도 크기 재검증
+                    blur_area = (lx2 - lx1) * (ly2 - ly1)
+                    if blur_area > frame_width * frame_height * 0.03:
+                        keys_to_remove.append(tid)
+                        continue
 
                     roi = frame[ly1:ly2, lx1:lx2]
                     if roi.size > 0:
                         try:
                             # 블러 정도
-                            kw = int((lx2-lx1)/2) | 1
-                            kh = int((ly2-ly1)/2) | 1
+                            kw = int((lx2-lx1)/1.5) | 1
+                            kh = int((ly2-ly1)/1.5) | 1
                             blurred_plate = cv2.GaussianBlur(roi, (kw, kh), 0)
                             frame[ly1:ly2, lx1:lx2] = blurred_plate
                         except: pass # 메모리 블러는 실패해도 조용히 넘어감
+                    
+                    # 예측 좌표를 메모리에 업데이트 (원본 좌표만, 확장된 건 저장 안함)
+                    original_w = old_coords[2] - old_coords[0]
+                    original_h = old_coords[3] - old_coords[1]
+                    info['coords'] = predicted_coords  # 확장 전 좌표 저장
                     
                     # 수명 감소 (0이 되면 삭제)
                     info['life'] -= 1
@@ -513,7 +672,7 @@ def process_video_for_privacy(video_path: str, original_filename: str) -> dict:
                 except: input_crop = car_crop
 
                 # 자른 이미지에서 번호판 찾기 (확대한 상태에서 찾음)
-                zoom_results = plate_model.predict(input_crop, conf=0.05, imgsz=640, verbose=False)
+                zoom_results = plate_model.predict(input_crop, conf=0.1, imgsz=640, verbose=False)
 
                 if zoom_results:
                     for z_result in zoom_results:
