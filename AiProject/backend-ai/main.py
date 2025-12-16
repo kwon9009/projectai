@@ -238,14 +238,16 @@ def process_video_for_privacy(video_path: str, post_id: int) -> dict:
         original_name_ext = parts[1] if len(parts) > 1 else filename_with_uuid
         name, ext = os.path.splitext(original_name_ext)
         now_str = datetime.now().strftime("%Y%m%d%H%M%S")
-        blurred_filename = f"{name}_blurred_{now_str}{ext}"
+        
+        # 임시 파일은 AVI로 저장 (OpenCV 호환성), 최종 파일은 MP4
+        temp_filename = f"{name}_blurred_{now_str}_temp.avi"
+        temp_filepath = os.path.join(UPLOAD_DIRECTORY, temp_filename)
+        blurred_filename = f"{name}_blurred_{now_str}.mp4"
         blurred_filepath = os.path.join(UPLOAD_DIRECTORY, blurred_filename)
 
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
-        out = cv2.VideoWriter(blurred_filepath, fourcc, fps, (frame_width, frame_height))
-        if not out.isOpened():
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(blurred_filepath, fourcc, fps, (frame_width, frame_height))
+        # OpenCV VideoWriter (XVID 코덱으로 AVI 저장)
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        out = cv2.VideoWriter(temp_filepath, fourcc, fps, (frame_width, frame_height))
 
         # --- 헬퍼 함수들 (팀원 코드에서 가져옴) ---
         def is_valid_plate(x1, y1, x2, y2, frame_w, frame_h):
@@ -566,7 +568,29 @@ def process_video_for_privacy(video_path: str, post_id: int) -> dict:
         cap.release()
         out.release()
         
-        print(f"\n분석 완료. 저장됨: {blurred_filename} (Faces: {face_count}, Plates: {plate_count})")
+        # ffmpeg로 AVI → MP4 (H.264) 변환 (브라우저 호환)
+        print(f"\n🔄 ffmpeg로 MP4 변환 중...")
+        import subprocess
+        ffmpeg_cmd = [
+            'ffmpeg', '-y', '-i', temp_filepath,
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart',
+            blurred_filepath
+        ]
+        try:
+            subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
+            # 임시 AVI 파일 삭제
+            if os.path.exists(temp_filepath):
+                os.remove(temp_filepath)
+            print(f"✅ MP4 변환 완료: {blurred_filename}")
+        except subprocess.CalledProcessError as e:
+            print(f"⚠️ ffmpeg 변환 실패, AVI 파일 사용: {e}")
+            # 변환 실패시 AVI 파일을 결과로 사용
+            blurred_filepath = temp_filepath
+            blurred_filename = temp_filename
+        
+        print(f"분석 완료. 저장됨: {blurred_filename} (Faces: {face_count}, Plates: {plate_count})")
 
         return {
             "analyzed_video_url": f"/uploads/{blurred_filename}",
